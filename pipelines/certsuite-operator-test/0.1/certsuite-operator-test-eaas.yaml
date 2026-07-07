@@ -317,19 +317,40 @@ spec:
               echo "[$(date -u +%FT%T.%3NZ)] Deploying operator: package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
               oc whoami || { echo "ERROR: Cannot connect to cluster"; exit 1; }
 
-              if ! bundle_render_out=$(opm render "${BUNDLE_IMAGE}"); then
-                echo "ERROR: Failed to render bundle image" >&2
-                exit 1
-              fi
+              # ── Resolve bundle to quay.io ──────────────────────────────────
+              BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
+              FBC_BASE="${FBC_FRAGMENT%%@*}"
+              TENANT_AND_REPO="${FBC_BASE#quay.io/redhat-user-workloads/}"
+              TENANT="${TENANT_AND_REPO%%/*}"
+              FBC_REPO="${TENANT_AND_REPO#*/}"
+              BUNDLE_REPO=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-mono-/')
+              QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO}@${BUNDLE_DIGEST}"
 
-              # Determine install namespace
-              INSTALL_NAMESPACE=$(echo "${bundle_render_out}" | \
-                jq -r 'select(.schema == "olm.bundle") | .properties[]? |
-                select(.type == "olm.bundle.object") | .value.data' 2>/dev/null | \
-                base64 -d 2>/dev/null | \
-                jq -r 'select(.kind == "ClusterServiceVersion") |
-                .metadata.annotations["operatorframework.io/suggested-namespace"] // empty' 2>/dev/null | \
-                head -1)
+              echo "[$(date -u +%FT%T.%3NZ)] Trying: ${QUAY_BUNDLE}"
+              if ! skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null; then
+                BUNDLE_REPO2=$(echo "${FBC_REPO}" | sed 's/-fbc-/-bundle-/')
+                QUAY_BUNDLE="quay.io/redhat-user-workloads/${TENANT}/${BUNDLE_REPO2}@${BUNDLE_DIGEST}"
+                echo "[$(date -u +%FT%T.%3NZ)] Trying: ${QUAY_BUNDLE}"
+                skopeo inspect --raw "docker://${QUAY_BUNDLE}" &>/dev/null || \
+                  { echo "ERROR: Cannot resolve bundle at quay.io"; exit 1; }
+              fi
+              echo "[$(date -u +%FT%T.%3NZ)] Resolved bundle: ${QUAY_BUNDLE}"
+
+              # ── Render FBC and patch bundle reference to quay.io ────────────
+              echo "[$(date -u +%FT%T.%3NZ)] Rendering FBC and patching bundle reference..."
+              opm render "${FBC_FRAGMENT}" > /tmp/fbc-original.json
+
+              # Replace the registry.redhat.io bundle reference with quay.io
+              sed "s|${BUNDLE_IMAGE}|${QUAY_BUNDLE}|g" /tmp/fbc-original.json > /tmp/fbc-patched.json
+
+              # Get bundle name
+              BUNDLE_NAME=$(jq -r 'select(.schema == "olm.bundle") | .name' /tmp/fbc-patched.json | head -1)
+              echo "[$(date -u +%FT%T.%3NZ)] Bundle name: ${BUNDLE_NAME}"
+
+              # ── Determine install namespace from FBC metadata ────────────────
+              INSTALL_NAMESPACE=$(jq -r 'select(.schema == "olm.bundle") | .properties[]? |
+                select(.type == "olm.csv.metadata") | .value.annotations["operatorframework.io/suggested-namespace"] // empty' \
+                /tmp/fbc-patched.json 2>/dev/null | grep -v '^$' | head -1)
 
               if [[ -z "${INSTALL_NAMESPACE}" || "${INSTALL_NAMESPACE}" == "null" ]]; then
                 INSTALL_NAMESPACE=$(oc create -f - -o jsonpath='{.metadata.name}' <<NS_EOF
@@ -346,7 +367,7 @@ spec:
               echo "[$(date -u +%FT%T.%3NZ)] Namespace: ${INSTALL_NAMESPACE}"
               echo -n "${INSTALL_NAMESPACE}" > /workspace/install-namespace
 
-              # OperatorGroup
+              # ── OperatorGroup (OwnNamespace) ─────────────────────────────────
               EXISTING_OG=$(oc -n "${INSTALL_NAMESPACE}" get operatorgroup -o jsonpath="{.items[*].metadata.name}" 2>/dev/null || true)
               if [[ -z "${EXISTING_OG}" ]]; then
                 oc create -f - <<OG_EOF
@@ -356,11 +377,71 @@ spec:
                 generateName: oo-
                 namespace: ${INSTALL_NAMESPACE}
               spec:
-                targetNamespaces: []
+                targetNamespaces:
+                  - ${INSTALL_NAMESPACE}
               OG_EOF
               fi
 
-              # CatalogSource
+              # ── Deploy catalog server with patched FBC ───────────────────────
+              echo "[$(date -u +%FT%T.%3NZ)] Deploying patched FBC catalog server..."
+              oc create configmap patched-fbc-catalog \
+                --from-file=catalog.json=/tmp/fbc-patched.json \
+                -n "${INSTALL_NAMESPACE}"
+
+              oc apply -f - <<CATALOG_SERVER_EOF
+              apiVersion: apps/v1
+              kind: Deployment
+              metadata:
+                name: patched-fbc-server
+                namespace: ${INSTALL_NAMESPACE}
+              spec:
+                replicas: 1
+                selector:
+                  matchLabels:
+                    app: patched-fbc-server
+                template:
+                  metadata:
+                    labels:
+                      app: patched-fbc-server
+                  spec:
+                    containers:
+                      - name: opm
+                        image: quay.io/operator-framework/opm:latest
+                        command: ["opm", "serve", "/catalog", "--cache-dir", "/tmp/cache"]
+                        ports:
+                          - containerPort: 50051
+                            name: grpc
+                        volumeMounts:
+                          - name: catalog
+                            mountPath: /catalog
+                        readinessProbe:
+                          grpc:
+                            port: 50051
+                          initialDelaySeconds: 5
+                    volumes:
+                      - name: catalog
+                        configMap:
+                          name: patched-fbc-catalog
+              ---
+              apiVersion: v1
+              kind: Service
+              metadata:
+                name: patched-fbc-server
+                namespace: ${INSTALL_NAMESPACE}
+              spec:
+                selector:
+                  app: patched-fbc-server
+                ports:
+                  - port: 50051
+                    targetPort: 50051
+                    protocol: TCP
+              CATALOG_SERVER_EOF
+
+              # Wait for catalog server pod ready
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for catalog server..."
+              oc rollout status deployment/patched-fbc-server -n "${INSTALL_NAMESPACE}" --timeout=120s
+
+              # ── CatalogSource pointing to our patched server ─────────────────
               CATSRC=$(oc create -f - -o jsonpath='{.metadata.name}' <<CS_EOF
               apiVersion: operators.coreos.com/v1alpha1
               kind: CatalogSource
@@ -369,13 +450,13 @@ spec:
                 namespace: ${INSTALL_NAMESPACE}
               spec:
                 sourceType: grpc
-                image: ${FBC_FRAGMENT}
-                displayName: "Certsuite Test Catalog"
+                address: "patched-fbc-server.${INSTALL_NAMESPACE}.svc:50051"
+                displayName: "Certsuite Test Catalog (patched)"
                 publisher: "konflux-certsuite"
               CS_EOF
               )
 
-              # Wait for CatalogSource
+              # Wait for CatalogSource READY
               for i in $(seq 1 60); do
                 STATE=$(oc get catalogsource "${CATSRC}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.connectionState.lastObservedState}' 2>/dev/null || echo "")
@@ -383,9 +464,10 @@ spec:
                 [[ ${i} -eq 60 ]] && { echo "ERROR: CatalogSource not ready"; exit 1; }
                 sleep 10
               done
+              echo "[$(date -u +%FT%T.%3NZ)] CatalogSource ${CATSRC} READY"
 
-              # Bundle name + Subscription
-              BUNDLE_NAME=$(echo "${bundle_render_out}" | jq -r 'select(.schema == "olm.bundle") | .name' | head -1)
+              # ── Subscription ─────────────────────────────────────────────────
+              BUNDLE_NAME=$(jq -r 'select(.schema == "olm.bundle") | .name' /tmp/fbc-patched.json | head -1)
 
               SUB=$(oc create -f - -o jsonpath='{.metadata.name}' <<SUB_EOF
               apiVersion: operators.coreos.com/v1alpha1
@@ -403,22 +485,55 @@ spec:
               SUB_EOF
               )
 
-              # Wait for CSV
-              for i in $(seq 1 90); do
+              # Wait for OLM to create CSV
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for OLM to create CSV..."
+              CSV=""
+              for i in $(seq 1 60); do
                 CSV=$(oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" \
                   -o jsonpath='{.status.installedCSV}' 2>/dev/null || echo "")
-                if [[ -n "${CSV}" ]]; then
-                  PHASE=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
-                    -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-                  if [[ "${PHASE}" == "Succeeded" ]]; then
-                    echo "[$(date -u +%FT%T.%3NZ)] CSV '${CSV}' ready"
-                    exit 0
-                  fi
+                [[ -n "${CSV}" ]] && break
+                sleep 5
+              done
+              if [[ -z "${CSV}" ]]; then
+                echo "ERROR: OLM did not create CSV" >&2
+                oc get subscription "${SUB}" -n "${INSTALL_NAMESPACE}" -o yaml >&2
+                exit 1
+              fi
+              echo "[$(date -u +%FT%T.%3NZ)] CSV created: ${CSV}"
+
+              # Patch CSV for Hypershift compatibility
+              echo "[$(date -u +%FT%T.%3NZ)] Patching CSV for Hypershift..."
+              CSV_JSON=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o json)
+              CSV_JSON=$(echo "${CSV_JSON}" | jq 'del(.spec.minKubeVersion)')
+              CSV_JSON=$(echo "${CSV_JSON}" | jq '
+                (.spec.install.spec.deployments[]?.spec.template.spec.nodeSelector) |=
+                  (if . then del(.["node-role.kubernetes.io/master"]) else . end)')
+              echo "${CSV_JSON}" | oc apply -f - 2>&1
+
+              # Delete deployment so OLM recreates from patched CSV
+              DEP_NAMES=$(echo "${CSV_JSON}" | jq -r '.spec.install.spec.deployments[]?.name')
+              for DEP in ${DEP_NAMES}; do
+                oc delete deployment "${DEP}" -n "${INSTALL_NAMESPACE}" --ignore-not-found 2>&1
+              done
+
+              # Wait for CSV Succeeded
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for CSV phase=Succeeded..."
+              for i in $(seq 1 120); do
+                PHASE=$(oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" \
+                  -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+                if [[ "${PHASE}" == "Succeeded" ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] CSV '${CSV}' ready"
+                  exit 0
+                elif [[ "${PHASE}" == "Failed" ]]; then
+                  echo "ERROR: CSV failed" >&2
+                  oc get csv "${CSV}" -n "${INSTALL_NAMESPACE}" -o jsonpath='{.status.message}' >&2
+                  exit 1
                 fi
                 sleep 10
               done
 
-              echo "ERROR: Timed out waiting for CSV" >&2
+              echo "ERROR: Timed out waiting for CSV (phase=${PHASE})" >&2
+              oc get pods -n "${INSTALL_NAMESPACE}" -o wide >&2 || true
               exit 1
 
           # ── Step 3: Deploy operands from test bundle ─────────────────
