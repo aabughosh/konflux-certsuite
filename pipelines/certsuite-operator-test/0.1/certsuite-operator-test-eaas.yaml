@@ -168,7 +168,7 @@ spec:
                   value: stepactions/bundles/pick-cluster-arch/0.1/pick-cluster-arch.yaml
             params:
               - name: bundleImage
-                value: "$(tasks.get-unreleased-bundle.results.unreleasedBundle)"
+                value: "$(tasks.parse-metadata.results.component-container-image)"
 
     # ── 5. Provision Ephemeral Cluster ─────────────────────────────────
     - name: provision-cluster
