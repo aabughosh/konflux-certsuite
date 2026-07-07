@@ -406,8 +406,8 @@ spec:
                   spec:
                     containers:
                       - name: opm
-                        image: quay.io/operator-framework/opm:latest
-                        command: ["opm", "serve", "/catalog", "--cache-dir", "/tmp/cache"]
+                        image: ${FBC_FRAGMENT}
+                        command: ["/bin/opm", "serve", "/catalog"]
                         ports:
                           - containerPort: 50051
                             name: grpc
@@ -415,9 +415,10 @@ spec:
                           - name: catalog
                             mountPath: /catalog
                         readinessProbe:
-                          grpc:
-                            port: 50051
+                          exec:
+                            command: ["/bin/grpc_health_probe", "-addr=:50051"]
                           initialDelaySeconds: 5
+                          periodSeconds: 5
                     volumes:
                       - name: catalog
                         configMap:
@@ -538,7 +539,7 @@ spec:
 
           # ── Step 3: Deploy operands from test bundle ─────────────────
           - name: deploy-operands
-            image: quay.io/openshift/origin-cli:latest
+            image: quay.io/konflux-ci/konflux-test:v1.4.31@sha256:a7cae9e96663e277a3904d0c78630508ddb6cc8eebaa912a840bd20f68dcaad1
             volumeMounts:
               - name: credentials
                 mountPath: /credentials
