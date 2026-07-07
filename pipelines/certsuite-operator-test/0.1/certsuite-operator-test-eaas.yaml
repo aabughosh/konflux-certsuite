@@ -21,8 +21,12 @@ spec:
     - name: TEST_BUNDLE_REF
       type: string
       description: |
-        Git URL (with optional #path fragment) pointing to the operator's
-        certsuite test bundle.
+        Git URL pointing to the operator's certsuite test bundle.
+        Format: URL[.git@revision][#path]
+        Examples:
+          https://github.com/org/repo.git@main#tests/my-bundle
+          https://github.com/org/repo#tests/my-bundle
+          https://github.com/org/repo.git@fix/my-branch#tests/my-bundle
     - name: CERTSUITE_LABELS
       type: string
       default: ""
@@ -317,6 +321,18 @@ spec:
               echo "[$(date -u +%FT%T.%3NZ)] Deploying operator: package=${PACKAGE_NAME} channel=${CHANNEL_NAME}"
               oc whoami || { echo "ERROR: Cannot connect to cluster"; exit 1; }
 
+              # ── Wait for at least one worker node to be Ready ──────────────
+              echo "[$(date -u +%FT%T.%3NZ)] Waiting for worker nodes..."
+              for i in $(seq 1 90); do
+                READY_NODES=$(oc get nodes --no-headers 2>/dev/null | grep -c ' Ready' || echo "0")
+                if [[ "${READY_NODES}" -gt 0 ]]; then
+                  echo "[$(date -u +%FT%T.%3NZ)] ${READY_NODES} node(s) Ready"
+                  break
+                fi
+                [[ ${i} -eq 90 ]] && { echo "ERROR: No nodes became Ready within 450s"; exit 1; }
+                sleep 5
+              done
+
               # ── Resolve bundle to quay.io ──────────────────────────────────
               BUNDLE_DIGEST="${BUNDLE_IMAGE##*@}"
               FBC_BASE="${FBC_FRAGMENT%%@*}"
@@ -440,7 +456,16 @@ spec:
 
               # Wait for catalog server pod ready
               echo "[$(date -u +%FT%T.%3NZ)] Waiting for catalog server..."
-              oc rollout status deployment/patched-fbc-server -n "${INSTALL_NAMESPACE}" --timeout=120s
+              if ! oc rollout status deployment/patched-fbc-server -n "${INSTALL_NAMESPACE}" --timeout=300s; then
+                echo "ERROR: catalog server rollout failed. Diagnosing..."
+                oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server -o wide 2>&1 || true
+                POD=$(oc get pods -n "${INSTALL_NAMESPACE}" -l app=patched-fbc-server -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+                if [[ -n "${POD}" ]]; then
+                  oc describe pod "${POD}" -n "${INSTALL_NAMESPACE}" 2>&1 | tail -30 || true
+                  oc logs "${POD}" -n "${INSTALL_NAMESPACE}" --tail=20 2>&1 || true
+                fi
+                exit 1
+              fi
 
               # ── CatalogSource pointing to our patched server ─────────────────
               CATSRC=$(oc create -f - -o jsonpath='{.metadata.name}' <<CS_EOF
@@ -559,13 +584,25 @@ spec:
               BUNDLE_DIR="/workspace/test-bundle"
               mkdir -p "${BUNDLE_DIR}"
 
-              GIT_URL="${TEST_BUNDLE_REF%%#*}"
+              GIT_URL_AND_REV="${TEST_BUNDLE_REF%%#*}"
               BUNDLE_PATH="${TEST_BUNDLE_REF#*#}"
               [[ "${BUNDLE_PATH}" == "${TEST_BUNDLE_REF}" ]] && BUNDLE_PATH="."
 
-              echo "[$(date -u +%FT%T.%3NZ)] Cloning ${GIT_URL} (path: ${BUNDLE_PATH})"
+              # Split URL@revision — only split on the last '@' after '.git'
+              if [[ "${GIT_URL_AND_REV}" == *".git@"* ]]; then
+                GIT_URL="${GIT_URL_AND_REV%.git@*}.git"
+                GIT_REV="${GIT_URL_AND_REV##*.git@}"
+              else
+                GIT_URL="${GIT_URL_AND_REV}"
+                GIT_REV=""
+              fi
+
+              BRANCH_ARGS=""
+              [[ -n "${GIT_REV}" ]] && BRANCH_ARGS="-b ${GIT_REV}"
+
+              echo "[$(date -u +%FT%T.%3NZ)] Cloning ${GIT_URL} (rev: ${GIT_REV:-HEAD}, path: ${BUNDLE_PATH})"
               CLONE_DIR=$(mktemp -d)
-              git clone --depth 1 "${GIT_URL}" "${CLONE_DIR}"
+              git clone --depth 1 ${BRANCH_ARGS} "${GIT_URL}" "${CLONE_DIR}"
               cp -r "${CLONE_DIR}/${BUNDLE_PATH}/." "${BUNDLE_DIR}/"
               rm -rf "${CLONE_DIR}"
 
